@@ -1,11 +1,15 @@
 package pl.domzal.junit.docker.rule;
 
 import java.io.IOException;
+import java.net.Socket;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 
+import com.spotify.docker.client.messages.*;
 import org.apache.commons.lang.StringUtils;
 import org.junit.Rule;
 import org.junit.rules.ExternalResource;
@@ -21,13 +25,6 @@ import com.spotify.docker.client.DockerException;
 import com.spotify.docker.client.DockerRequestException;
 import com.spotify.docker.client.ImageNotFoundException;
 import com.spotify.docker.client.LogStream;
-import com.spotify.docker.client.messages.ContainerConfig;
-import com.spotify.docker.client.messages.ContainerCreation;
-import com.spotify.docker.client.messages.ContainerInfo;
-import com.spotify.docker.client.messages.ContainerState;
-import com.spotify.docker.client.messages.HostConfig;
-import com.spotify.docker.client.messages.Image;
-import com.spotify.docker.client.messages.PortBinding;
 
 import pl.domzal.junit.docker.rule.WaitForUnit.WaitForCondition;
 
@@ -44,7 +41,7 @@ import pl.domzal.junit.docker.rule.WaitForUnit.WaitForCondition;
  * Inspired by and loosely based on <a href="https://gist.github.com/mosheeshel/c427b43c36b256731a0b">osheeshel/DockerContainerRule</a>.
  */
 public class DockerRule extends ExternalResource {
-
+    public static final String DEFAULT_DOCKER_NET_PROTOCOL_TCP = "/tcp";
     private static Logger log = LoggerFactory.getLogger(DockerRule.class);
 
     private static final int STOP_TIMEOUT = 5;
@@ -61,6 +58,8 @@ public class DockerRule extends ExternalResource {
     private Map<String, List<PortBinding>> containerPorts;
 
     private DockerLogs dockerLogs;
+    //this flag will be used to safeguard that no containers build outside the DockerRule context will be shutdown
+    private AtomicBoolean containerStartedOutsideDockerRuleContext = new AtomicBoolean(false);
 
     DockerRule(DockerRuleBuilder builder) {
         this.builder = builder;
@@ -93,6 +92,22 @@ public class DockerRule extends ExternalResource {
      */
     @Override
     public final void before() throws Throwable {
+        boolean skipImagePull = isDockerImageWithSameNameRunning(dockerClient, builder);
+        if (skipImagePull) {
+            log.warn("An container with the same image name {} is already up and running. SKIPPING The creation part",
+                    builder.imageName());
+            containerStartedOutsideDockerRuleContext.set(true);
+            return;
+        }
+        boolean portConflictWithExistingContainers = portConflictExists(dockerClient, builder);
+        if (portConflictWithExistingContainers) {
+            log.warn("A conflict on ports has been found skipping the creation of container for image {}",
+                    builder.imageName());
+            containerStartedOutsideDockerRuleContext.set(true);
+            return;
+        }
+
+
         HostConfig hostConfig = HostConfig.builder()//
                 .publishAllPorts(builder.publishAllPorts())//
                 .portBindings(builder.hostPortBindings())//
@@ -243,7 +258,7 @@ public class DockerRule extends ExternalResource {
      * @return Host port container port is exposed on.
      */
     public final String getExposedContainerPort(String containerPort) {
-        String key = containerPort + "/tcp";
+        String key = containerPort + DEFAULT_DOCKER_NET_PROTOCOL_TCP;
         List<PortBinding> list = containerPorts.get(key);
         if (list == null || list.size() == 0) {
             throw new IllegalStateException(String.format("%s is not exposed", key));
@@ -317,6 +332,90 @@ public class DockerRule extends ExternalResource {
 
     }
 
+
+    /**
+     * Will check docker images with the same names to be running on this host
+     *
+     * @param dockerClient
+     * @param dockerRuleBuilder
+     * @return true in case a docker image with the same name already running
+     */
+    private boolean isDockerImageWithSameNameRunning(DockerClient dockerClient, DockerRuleBuilder dockerRuleBuilder) {
+        try {
+            List<Container> dockerAliveContainers = dockerClient.listContainers();
+            for (Container container : dockerAliveContainers) {
+                if (container.image().equalsIgnoreCase(dockerRuleBuilder.imageName())) {
+                    return true;
+                }
+            }
+            return false;
+        } catch (DockerException | InterruptedException ex) {
+            throw new IllegalStateException(ex);
+        }
+    }
+
+    /**
+     * Will check for port conflicts both on the existing docker containers that might already run
+     * an on this host
+     *
+     * @param dockerClient
+     * @param dockerRuleBuilder
+     * @return true in case a port of the container conflicts with another service (container or native host's service)
+     */
+    private boolean portConflictExists(DockerClient dockerClient, DockerRuleBuilder dockerRuleBuilder) {
+        try {
+            List<Container> dockerAliveContainers = dockerClient.listContainers();
+            for (Container container : dockerAliveContainers) {
+                Set<String> exposedPorts = dockerRuleBuilder.containerExposedPorts();
+                List<Container.PortMapping> portMappings = container.ports();
+                for (Container.PortMapping portMapping : portMappings) {
+                    if (exposedPorts.contains(ExposePortBindingBuilder.containerBindWithProtocol(
+                            portMapping.getPublicPort()))) {
+                        log.warn("Discovered port {} conflict for image {} from the containerId {}",
+                                portMapping.getPublicPort(), dockerRuleBuilder.imageName(), container.imageId());
+                        return true;
+                    }
+
+                }
+                for (String portWithProtocol : exposedPorts) {
+                    if (!isPortAvailable(ExposePortBindingBuilder.containerBindWithOutProtocol(portWithProtocol),
+                            "localhost")) {
+                        log.warn("Discovered port {} conflict for image {}", portWithProtocol,
+                                dockerRuleBuilder.imageName());
+                        return true;
+                    }
+                }
+
+            }
+            return false;
+        } catch (DockerException | InterruptedException ex) {
+            throw new IllegalStateException(ex);
+        }
+    }
+
+    private static boolean isPortAvailable(int port, String host) {
+        Socket s = null;
+        try {
+            s = new Socket(host, port);
+
+            // If the code makes it this far without an exception it means
+            // something is using the port and has responded.
+            log.warn("--------------Port " + port + " is not available");
+            return false;
+        } catch (IOException e) {
+            return true;
+        } finally {
+            if (s != null) {
+                try {
+                    s.close();
+                } catch (IOException e) {
+                    throw new RuntimeException("You should handle this error.", e);
+                }
+            }
+        }
+    }
+
+
     /**
      * Id of container (null if it is not yet been created or has been stopped).
      */
@@ -330,5 +429,8 @@ public class DockerRule extends ExternalResource {
     DockerClient getDockerClient() {
         return dockerClient;
     }
+
+
+
 
 }

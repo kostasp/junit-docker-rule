@@ -25,6 +25,15 @@ class ExposePortBindingBuilder {
         return new ExposePortBindingBuilder();
     }
 
+    public static int containerBindWithOutProtocol(String portWithProtocol) {
+        return Integer.valueOf(portWithProtocol.replace(DockerRule.DEFAULT_DOCKER_NET_PROTOCOL_TCP, ""));
+    }
+
+    public static String containerBindWithProtocol(int containerPort) {
+        return containerPort + DockerRule.DEFAULT_DOCKER_NET_PROTOCOL_TCP;
+    }
+
+
     public ExposePortBindingBuilder expose(String hostPort, String containerPort) {
         assertIsNumber(hostPort);
         assertValidContainerPort(containerPort);
@@ -45,7 +54,7 @@ class ExposePortBindingBuilder {
         if (isPortWithProtocol(containerPort)) {
             return containerPort;
         } else if (StringUtils.isNumeric(containerPort)) {
-            return containerPort + "/tcp";
+            return containerPort + DockerRule.DEFAULT_DOCKER_NET_PROTOCOL_TCP;
         } else {
             throw new InvalidPortDefinition(containerPort);
         }
