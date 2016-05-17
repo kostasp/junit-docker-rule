@@ -30,15 +30,18 @@ public class DockerRuleBuilder {
     private boolean imageAlwaysPull = false;
     private PrintStream stdoutWriter;
     private PrintStream stderrWriter;
+    private String containerName;
+    private List<String> links = new ArrayList<>();
 
-    DockerRuleBuilder(){}
+    DockerRuleBuilder() {
+    }
 
     public DockerRule build() {
         return new DockerRule(this);
     }
 
     private static String[] nullToEmpty(String[] value) {
-        return value==null ? new String[0] : value;
+        return value == null ? new String[0] : value;
     }
 
     /**
@@ -48,6 +51,7 @@ public class DockerRuleBuilder {
         this.entrypoint = entrypoint;
         return this;
     }
+
     String[] entrypoint() {
         return nullToEmpty(entrypoint);
     }
@@ -59,6 +63,7 @@ public class DockerRuleBuilder {
         this.cmd = cmd;
         return this;
     }
+
     String[] cmd() {
         return nullToEmpty(cmd);
     }
@@ -70,6 +75,7 @@ public class DockerRuleBuilder {
         this.imageName = imageName;
         return this;
     }
+
     String imageName() {
         if (StringUtils.isEmpty(imageName)) {
             throw new IllegalStateException("imageName cannot be empty");
@@ -79,12 +85,14 @@ public class DockerRuleBuilder {
 
     /**
      * Add extra host definitions into containers <code>/etc/hosts</code>.
+     *
      * @param extraHosts List of host matching format "hostname:address" (like desribed for 'docker run --add-host').
      */
     public DockerRuleBuilder extraHosts(String... extraHosts) {
         this.extraHosts = extraHosts;
         return this;
     }
+
     String[] extraHosts() {
         return nullToEmpty(extraHosts);
     }
@@ -98,20 +106,23 @@ public class DockerRuleBuilder {
         this.waitForMessage = waitForMessage;
         return this;
     }
+
     /**
      * Make rule to wait for specified text in log on container start.
      *
      * @param waitForMessage Message to wait for.
-     * @param waitSeconds Number of seconds to wait. Rule startup will fail on timeout.
+     * @param waitSeconds    Number of seconds to wait. Rule startup will fail on timeout.
      */
     public DockerRuleBuilder waitForMessage(String waitForMessage, int waitSeconds) {
         this.waitForMessage = waitForMessage;
         this.waitForMessageSeconds = waitSeconds;
         return this;
     }
+
     String waitForMessage() {
         return waitForMessage;
     }
+
     int waitForMessageSeconds() {
         return waitForMessageSeconds;
     }
@@ -123,6 +134,7 @@ public class DockerRuleBuilder {
         this.keepContainer = keepContainer;
         return this;
     }
+
     boolean keepContainer() {
         return keepContainer;
     }
@@ -134,6 +146,7 @@ public class DockerRuleBuilder {
         this.imageAlwaysPull = alwaysPull;
         return this;
     }
+
     boolean imageAlwaysPull() {
         return imageAlwaysPull;
     }
@@ -149,6 +162,7 @@ public class DockerRuleBuilder {
     public DockerRuleMountBuilderTo mountFrom(String hostPath) throws InvalidVolumeFrom {
         return new DockerRuleMountBuilder(this, hostPath);
     }
+
     /**
      * Host directory to be mounted into container.<br/>
      * Please note that in boot2docker environments (OSX or Windows)
@@ -157,18 +171,28 @@ public class DockerRuleBuilder {
      * @param hostFileOrDir Directory or file to be mounted.
      */
     public DockerRuleMountBuilderTo mountFrom(File hostFileOrDir) throws InvalidVolumeFrom {
-        if ( ! hostFileOrDir.exists()) {
+        if (!hostFileOrDir.exists()) {
             throw new InvalidVolumeFrom(String.format("mountFrom: %s does not exist", hostFileOrDir.getAbsolutePath()));
         }
         String hostDirUnixPath = DockerRuleMountBuilder.toUnixStylePath(hostFileOrDir.getAbsolutePath());
         return new DockerRuleMountBuilder(this, hostDirUnixPath);
     }
+
     DockerRuleBuilder addBind(String bindString) {
         binds.add(bindString);
         return this;
     }
+
     List<String> binds() {
         return binds;
+    }
+
+    List<String> links() {
+        return links;
+    }
+
+    String getContainerName() {
+        return containerName;
     }
 
     /**
@@ -178,6 +202,7 @@ public class DockerRuleBuilder {
         env.add(String.format("%s=%s", envName, envValue));
         return this;
     }
+
     List<String> env() {
         return Collections.unmodifiableList(env);
     }
@@ -188,7 +213,7 @@ public class DockerRuleBuilder {
      * host ports. <b>Using manual expose disables this so user must
      * expose all required ports by hand</b>.
      *
-     * @param hostPort Host port internal port will be mapped to.
+     * @param hostPort      Host port internal port will be mapped to.
      * @param containerPort Container port to map to host.
      */
     public DockerRuleBuilder expose(String hostPort, String containerPort) {
@@ -196,9 +221,11 @@ public class DockerRuleBuilder {
         exposeBuilder.expose(hostPort, containerPort);
         return this;
     }
+
     Map<String, List<PortBinding>> hostPortBindings() {
         return Collections.unmodifiableMap(exposeBuilder.hostBindings());
     }
+
     Set<String> containerExposedPorts() {
         return exposeBuilder.containerExposedPorts();
     }
@@ -210,6 +237,7 @@ public class DockerRuleBuilder {
         this.stdoutWriter = stdoutWriter;
         return this;
     }
+
     PrintStream stdoutWriter() {
         return stdoutWriter;
     }
@@ -221,6 +249,7 @@ public class DockerRuleBuilder {
         this.stderrWriter = stderrWriter;
         return this;
     }
+
     PrintStream stderrWriter() {
         return stderrWriter;
     }
@@ -237,8 +266,21 @@ public class DockerRuleBuilder {
         this.publishAllPorts = publishAllPorts;
         return this;
     }
+
     boolean publishAllPorts() {
         return publishAllPorts;
     }
+
+    public DockerRuleBuilder containerName(String containerName) {
+        this.containerName = containerName;
+        return this;
+    }
+
+
+    public DockerRuleBuilder addLinks(List<String> links) {
+        this.links.addAll(links);
+        return this;
+    }
+
 
 }

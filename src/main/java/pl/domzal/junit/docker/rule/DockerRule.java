@@ -29,6 +29,8 @@ import com.spotify.docker.client.LogStream;
 import pl.domzal.junit.docker.rule.WaitForUnit.WaitForCondition;
 
 /**
+ * In order to be able to use this DockerRule the docker service should be installed to
+ * the underlying running host and it should be available to the running host's user
  * Simple docker container junit {@link Rule}.<br/>
  * Instances should be created via builder:
  * <pre>
@@ -38,15 +40,15 @@ import pl.domzal.junit.docker.rule.WaitForUnit.WaitForCondition;
  *      .build();
  * </pre>
  * <br/>
- * Inspired by and loosely based on <a href="https://gist.github.com/mosheeshel/c427b43c36b256731a0b">osheeshel/DockerContainerRule</a>.
+ * Inspired by and loosely based on <a href="https://gist.github.com/mosheeshel/c427b43c36b256731a0b">osheeshel/Docker
+ * ContainerRule</a>.
  */
 public class DockerRule extends ExternalResource {
-    public static final String DEFAULT_DOCKER_NET_PROTOCOL_TCP = "/tcp";
-    private static Logger log = LoggerFactory.getLogger(DockerRule.class);
 
+    public static final String DEFAULT_DOCKER_NET_PROTOCOL_TCP = "/tcp";
     private static final int STOP_TIMEOUT = 5;
     private static final int SHORT_ID_LEN = 12;
-
+    private static Logger log = LoggerFactory.getLogger(DockerRule.class);
     private final DockerRuleBuilder builder;
     private final String imageNameWithTag;
     private final DockerClient dockerClient;
@@ -68,8 +70,9 @@ public class DockerRule extends ExternalResource {
             dockerClient = DefaultDockerClient.fromEnv().build();
             log.debug("server.info: {}", dockerClient.info());
             log.debug("server.version: {}", dockerClient.version());
-            if (builder.imageAlwaysPull() || ! imageAvaliable(dockerClient, imageNameWithTag)) {
+            if (builder.imageAlwaysPull() || !imageAvailable(dockerClient, imageNameWithTag)) {
                 dockerClient.pull(imageNameWithTag);
+                log.debug("Pulling Image : {}", imageNameWithTag);
             }
         } catch (ImageNotFoundException e) {
             throw new ImagePullException(String.format("Image '%s' not found", imageNameWithTag), e);
@@ -78,11 +81,34 @@ public class DockerRule extends ExternalResource {
         }
     }
 
+
     /**
      * Builder to specify parameters and produce {@link DockerRule} instance.
      */
     public static DockerRuleBuilder builder() {
         return new DockerRuleBuilder();
+    }
+
+    private static boolean isPortAvailable(int port, String host) {
+        Socket s = null;
+        try {
+            s = new Socket(host, port);
+
+            // If the code makes it this far without an exception it means
+            // something is using the port and has responded.
+            log.warn("--------------Port " + port + " is not available");
+            return false;
+        } catch (IOException e) {
+            return true;
+        } finally {
+            if (s != null) {
+                try {
+                    s.close();
+                } catch (IOException e) {
+                    throw new RuntimeException("You should handle this error.", e);
+                }
+            }
+        }
     }
 
     /**
@@ -107,14 +133,14 @@ public class DockerRule extends ExternalResource {
             return;
         }
 
-
         HostConfig hostConfig = HostConfig.builder()//
                 .publishAllPorts(builder.publishAllPorts())//
                 .portBindings(builder.hostPortBindings())//
-                .binds(builder.binds())//
-                .extraHosts(builder.extraHosts())//
+                .binds(builder.binds())
+                .links(builder.links())
+                .extraHosts(builder.extraHosts())
                 .build();
-        ContainerConfig containerConfig = ContainerConfig.builder()//
+        ContainerConfig containerConfig = ContainerConfig.builder()
                 .hostConfig(hostConfig)//
                 .image(imageNameWithTag)//
                 .env(builder.env())//
@@ -137,11 +163,13 @@ public class DockerRule extends ExternalResource {
             containerIp = containerInfo.networkSettings().ipAddress();
             containerPorts = containerInfo.networkSettings().ports();
             containerGateway = containerInfo.networkSettings().gateway();
-            if (builder.waitForMessage()!=null) {
+            if (builder.waitForMessage() != null) {
                 waitForMessage();
             }
             logNetworkSettings();
-
+            //sleep for 4 seconds in order to wait the docker resources to be available. E.g when registering
+            // an elasticsearch or rabbit or redis and it takes long to be available
+            Thread.sleep(7000l);
         } catch (DockerRequestException e) {
             throw new IllegalStateException(e.message(), e);
         } catch (DockerException | InterruptedException e) {
@@ -149,18 +177,81 @@ public class DockerRule extends ExternalResource {
         }
     }
 
+    /**
+     * Will check docker images with the same names to be running on this host
+     *
+     * @param dockerClient
+     * @param dockerRuleBuilder
+     * @return true in case a docker image with the same name already running
+     */
+    private boolean isDockerImageWithSameNameRunning(DockerClient dockerClient, DockerRuleBuilder dockerRuleBuilder) {
+        try {
+            List<Container> dockerAliveContainers = dockerClient.listContainers();
+            for (Container container : dockerAliveContainers) {
+                if (container.image().equalsIgnoreCase(dockerRuleBuilder.imageName())) {
+                    return true;
+                }
+            }
+            return false;
+        } catch (DockerException | InterruptedException ex) {
+            throw new IllegalStateException(ex);
+        }
+    }
+
+    /**
+     * Will check for port conflicts both on the existing docker containers that might already run
+     * an on this host
+     *
+     * @param dockerClient
+     * @param dockerRuleBuilder
+     * @return true in case a port of the container conflicts with another service (container or native host's service)
+     */
+    private boolean portConflictExists(DockerClient dockerClient, DockerRuleBuilder dockerRuleBuilder) {
+        try {
+            List<Container> dockerAliveContainers = dockerClient.listContainers();
+            for (Container container : dockerAliveContainers) {
+                Set<String> exposedPorts = dockerRuleBuilder.containerExposedPorts();
+                List<Container.PortMapping> portMappings = container.ports();
+                for (Container.PortMapping portMapping : portMappings) {
+                    if (exposedPorts.contains(ExposePortBindingBuilder.containerBindWithProtocol(
+                            portMapping.getPublicPort()))) {
+                        log.warn("Discovered port {} conflict for image {} from the containerId {}",
+                                portMapping.getPublicPort(), dockerRuleBuilder.imageName(), container.imageId());
+                        return true;
+                    }
+
+                }
+            }
+            Set<String> exposedPorts = dockerRuleBuilder.containerExposedPorts();
+            for (String portWithProtocol : exposedPorts) {
+                if (!isPortAvailable(ExposePortBindingBuilder.containerBindWithOutProtocol(portWithProtocol),
+                        "localhost")) {
+                    log.warn("Discovered port {} conflict for image {}", portWithProtocol,
+                            dockerRuleBuilder.imageName());
+                    return true;
+                }
+            }
+
+
+            return false;
+        } catch (DockerException | InterruptedException ex) {
+            throw new IllegalStateException(ex);
+        }
+    }
+
     private void attachLogs(DockerClient dockerClient, String containerId) throws IOException, InterruptedException {
         dockerLogs = new DockerLogs(dockerClient, containerId);
-        if (builder.stdoutWriter()!=null) {
+        if (builder.stdoutWriter() != null) {
             dockerLogs.setStdoutWriter(builder.stdoutWriter());
         }
-        if (builder.stderrWriter()!=null) {
+        if (builder.stderrWriter() != null) {
             dockerLogs.setStderrWriter(builder.stderrWriter());
         }
         dockerLogs.start();
     }
 
-    private boolean imageAvaliable(DockerClient dockerClient, String imageName) throws DockerException, InterruptedException {
+    private boolean imageAvailable(DockerClient dockerClient, String imageName) throws DockerException,
+            InterruptedException {
         String imageNameWithTag = imageNameWithTag(imageName);
         List<Image> listImages = dockerClient.listImages(ListImagesParam.danglingImages(false));
         for (Image image : listImages) {
@@ -174,7 +265,7 @@ public class DockerRule extends ExternalResource {
     }
 
     private String imageNameWithTag(String imageName) {
-        if (! StringUtils.contains(imageName, ':')) {
+        if (!StringUtils.contains(imageName, ':')) {
             return imageName + ":latest";
         } else {
             return imageName;
@@ -184,11 +275,12 @@ public class DockerRule extends ExternalResource {
     private void waitForMessage() throws TimeoutException, InterruptedException {
         final String waitForMessage = builder.waitForMessage();
         log.info("{} waiting for log message '{}'", containerShortId, waitForMessage);
-        new WaitForUnit(TimeUnit.SECONDS, builder.waitForMessageSeconds(), new WaitForCondition(){
+        new WaitForUnit(TimeUnit.SECONDS, builder.waitForMessageSeconds(), new WaitForUnit.WaitForCondition() {
             @Override
             public boolean isConditionMet() {
                 return getLog().contains(waitForMessage);
             }
+
             @Override
             public String timeoutMessage() {
                 return String.format("Timeout waiting for '%s'", waitForMessage);
@@ -206,17 +298,22 @@ public class DockerRule extends ExternalResource {
     public final void after() {
         log.debug("after {}", containerShortId);
         try {
-            dockerLogs.close();
-            ContainerState state = dockerClient.inspectContainer(container.id()).state();
-            log.debug("{} state {}", containerShortId, state);
-            if (state.running()) {
-                dockerClient.stopContainer(container.id(), STOP_TIMEOUT);
-                log.info("{} stopped", containerShortId);
-            }
-            if (!builder.keepContainer()) {
-                dockerClient.removeContainer(container.id(), true);
-                log.info("{} deleted", containerShortId);
-                container = null;
+            //only proceed with stopping docker resources if the container
+            // has been started from this DockerRule context
+            if (!containerStartedOutsideDockerRuleContext.get()) {
+                dockerLogs.close();
+                ContainerState state = dockerClient.inspectContainer(container.id()).state();
+                log.debug("{} state {}", containerShortId, state);
+                if (state.running()) {
+                    dockerClient.stopContainer(container.id(), STOP_TIMEOUT);
+                    log.info("{} stopped", containerShortId);
+                }
+
+                if (!builder.keepContainer()) {
+                    dockerClient.removeContainer(container.id(), true);
+                    log.info("{} deleted", containerShortId);
+                    container = null;
+                }
             }
         } catch (DockerException e) {
             throw new IllegalStateException(e);
@@ -274,18 +371,19 @@ public class DockerRule extends ExternalResource {
     }
 
     private void logNetworkSettings() {
-        log.info("{} docker host: {}, ip: {}, gateway: {}, exposed ports: {}", containerShortId, dockerClient.getHost(), containerIp, containerGateway, containerPorts);
+        log.info("{} docker host: {}, ip: {}, gateway: {}, exposed ports: {}", containerShortId, dockerClient.getHost(),
+                containerIp, containerGateway, containerPorts);
     }
 
     /**
      * Stop and wait till given string will show in container output.
      *
      * @param searchString String to wait for in container output.
-     * @param waitTime Wait time.
+     * @param waitTime     Wait time.
      * @throws TimeoutException On wait timeout.
      */
     public void waitFor(final String searchString, int waitTime) throws TimeoutException, InterruptedException {
-        new WaitForUnit(TimeUnit.SECONDS, waitTime, TimeUnit.SECONDS, 1, new WaitForCondition() {
+        new WaitForUnit(TimeUnit.SECONDS, waitTime, TimeUnit.SECONDS, 1, new WaitForUnit.WaitForCondition() {
             @Override
             public boolean isConditionMet() {
                 return StringUtils.contains(getLog(), searchString);
@@ -302,7 +400,7 @@ public class DockerRule extends ExternalResource {
             }
 
         }) //
-        .startWaiting();
+                .startWaiting();
     }
 
     /**
@@ -332,95 +430,11 @@ public class DockerRule extends ExternalResource {
 
     }
 
-
-    /**
-     * Will check docker images with the same names to be running on this host
-     *
-     * @param dockerClient
-     * @param dockerRuleBuilder
-     * @return true in case a docker image with the same name already running
-     */
-    private boolean isDockerImageWithSameNameRunning(DockerClient dockerClient, DockerRuleBuilder dockerRuleBuilder) {
-        try {
-            List<Container> dockerAliveContainers = dockerClient.listContainers();
-            for (Container container : dockerAliveContainers) {
-                if (container.image().equalsIgnoreCase(dockerRuleBuilder.imageName())) {
-                    return true;
-                }
-            }
-            return false;
-        } catch (DockerException | InterruptedException ex) {
-            throw new IllegalStateException(ex);
-        }
-    }
-
-    /**
-     * Will check for port conflicts both on the existing docker containers that might already run
-     * an on this host
-     *
-     * @param dockerClient
-     * @param dockerRuleBuilder
-     * @return true in case a port of the container conflicts with another service (container or native host's service)
-     */
-    private boolean portConflictExists(DockerClient dockerClient, DockerRuleBuilder dockerRuleBuilder) {
-        try {
-            List<Container> dockerAliveContainers = dockerClient.listContainers();
-            for (Container container : dockerAliveContainers) {
-                Set<String> exposedPorts = dockerRuleBuilder.containerExposedPorts();
-                List<Container.PortMapping> portMappings = container.ports();
-                for (Container.PortMapping portMapping : portMappings) {
-                    if (exposedPorts.contains(ExposePortBindingBuilder.containerBindWithProtocol(
-                            portMapping.getPublicPort()))) {
-                        log.warn("Discovered port {} conflict for image {} from the containerId {}",
-                                portMapping.getPublicPort(), dockerRuleBuilder.imageName(), container.imageId());
-                        return true;
-                    }
-
-                }
-                for (String portWithProtocol : exposedPorts) {
-                    if (!isPortAvailable(ExposePortBindingBuilder.containerBindWithOutProtocol(portWithProtocol),
-                            "localhost")) {
-                        log.warn("Discovered port {} conflict for image {}", portWithProtocol,
-                                dockerRuleBuilder.imageName());
-                        return true;
-                    }
-                }
-
-            }
-            return false;
-        } catch (DockerException | InterruptedException ex) {
-            throw new IllegalStateException(ex);
-        }
-    }
-
-    private static boolean isPortAvailable(int port, String host) {
-        Socket s = null;
-        try {
-            s = new Socket(host, port);
-
-            // If the code makes it this far without an exception it means
-            // something is using the port and has responded.
-            log.warn("--------------Port " + port + " is not available");
-            return false;
-        } catch (IOException e) {
-            return true;
-        } finally {
-            if (s != null) {
-                try {
-                    s.close();
-                } catch (IOException e) {
-                    throw new RuntimeException("You should handle this error.", e);
-                }
-            }
-        }
-    }
-
-
     /**
      * Id of container (null if it is not yet been created or has been stopped).
      */
     public String getContainerId() {
-        return (container!=null ? container.id() : null);
+        return (container != null ? container.id() : null);
     }
 
     /**
@@ -430,7 +444,5 @@ public class DockerRule extends ExternalResource {
         return dockerClient;
     }
 
-
-
-
 }
+
